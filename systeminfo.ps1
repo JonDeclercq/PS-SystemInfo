@@ -122,63 +122,110 @@ try {
     $tpmVersion = "0.0"
     $tpmCompatible = $false
 
-    # Method 1: Try Get-Tpm cmdlet first (most reliable on newer systems)
-    try {
-        $tpm = Get-Tpm
-        if ($tpm) {
-            $tpmEnabled = $tpm.TpmPresent -and $tpm.TpmReady
-            $tpmCompatible = $tpm.TpmPresent
+    # Get detailed hardware info for custom-built detection
+    $motherboard = Get-WmiDataSafely -Class Win32_BaseBoard
+    $biosInfo = Get-WmiDataSafely -Class Win32_BIOS
+    $processorInfo = Get-WmiDataSafely -Class Win32_Processor | Select-Object -First 1
+
+    # Check CPU for built-in TPM support (Intel PTT or AMD fTPM)
+    $cpuManufacturer = Get-SafeValue -Object $processorInfo -PropertyName 'Manufacturer'
+    $cpuName = Get-SafeValue -Object $processorInfo -PropertyName 'Name'
+    $cpuGeneration = switch -Regex ($cpuName) {
+        # Intel processors (6th gen and newer support PTT)
+        'Intel.*?(Core.*?|Xeon.*?)\s*(\d)' {
+            try {
+                [int]$matches[2]
+            } catch { 0 }
         }
-    } catch {
-        Write-Warning "Get-Tpm failed, trying alternative methods"
+        # AMD processors (Ryzen supports fTPM)
+        'AMD.*?Ryzen' { 1 }  # Any Ryzen number indicates TPM 2.0 support
+        default { 0 }
     }
 
-    # Method 2: WMI TPM check if Get-Tpm failed
-    if (-not $tpmCompatible) {
-        $tpmWmi = Get-WmiDataSafely -Class Win32_Tpm -Namespace "root\CIMV2\Security\MicrosoftTpm"
-        if ($null -ne $tpmWmi) {
-            $tpmVersion = if ($tpmWmi.SpecVersion) { 
-                try {
-                    [System.Version]$tpmWmi.SpecVersion
-                    $tpmCompatible = $true
-                } catch {
-                    "0.0"
-                }
-            } else { "0.0" }
-            $tpmEnabled = $tpmWmi.IsEnabled_InitialValue -eq $true
-        }
+    # Get motherboard details
+    $mbManufacturer = Get-SafeValue -Object $motherboard -PropertyName 'Manufacturer'
+    $mbProduct = Get-SafeValue -Object $motherboard -PropertyName 'Product'
+    $biosVersion = Get-SafeValue -Object $biosInfo -PropertyName 'SMBIOSBIOSVersion'
+
+    # Known motherboard manufacturers that support TPM 2.0
+    $mbSupportsTpm = $mbManufacturer -match '(ASUS|ASRock|Gigabyte|MSI|BIOSTAR)' -or
+                    $mbProduct -match '(ROG|TUF|PRO|GAMING|AORUS)'
+
+    # Determine TPM compatibility based on hardware
+    $tpmCompatible = $false
+
+    # Check for Intel PTT or AMD fTPM capability
+    if ($cpuManufacturer -match 'Intel' -and $cpuGeneration -ge 6) {
+        $tpmCompatible = $true  # Intel 6th gen or newer supports PTT
+    } elseif ($cpuManufacturer -match 'AMD' -and $cpuName -match 'Ryzen') {
+        $tpmCompatible = $true  # All Ryzen processors support fTPM
     }
 
-    # Method 3: Registry check
+    # If not already determined compatible, check motherboard
+    if (-not $tpmCompatible -and $mbSupportsTpm) {
+        $tpmCompatible = $true
+    }
+
+    # Try standard TPM detection methods
     if (-not $tpmCompatible) {
+        # Try Get-Tpm
         try {
-            $tpmReg = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\TPM\*" -ErrorAction Stop
-            if ($tpmReg.SpecVersion) {
-                $tpmVersion = [System.Version]$tpmReg.SpecVersion
-                $tpmCompatible = $true
-                $tpmEnabled = $true
-            }
+            $tpm = Get-Tpm
+            $tpmCompatible = $tpm.TpmPresent
+            $tpmEnabled = $tpm.TpmPresent -and $tpm.TpmReady
         } catch {
-            Write-Warning "Registry TPM check failed"
+            Write-Verbose "Get-Tpm failed, continuing with other methods"
+        }
+
+        # Try WMI method
+        if (-not $tpmCompatible) {
+            $tpmWmi = Get-WmiDataSafely -Class Win32_Tpm -Namespace "root\CIMV2\Security\MicrosoftTpm"
+            if ($null -ne $tpmWmi) {
+                $tpmCompatible = $true
+                $tpmEnabled = $tpmWmi.IsEnabled_InitialValue -eq $true
+            }
+        }
+
+        # Check registry as last resort
+        if (-not $tpmCompatible) {
+            try {
+                $tpmRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\TPM\*"
+                if (Test-Path $tpmRegPath) {
+                    $tpmCompatible = $true
+                }
+            } catch {
+                Write-Verbose "Registry TPM check failed"
+            }
         }
     }
 
-    # Method 4: Manufacturer/Model check as last resort
-    if (-not $tpmCompatible) {
-        $manufacturer = Get-WmiDataSafely -Class Win32_ComputerSystem | Select-Object -ExpandProperty Manufacturer
-        # Most business/consumer systems made after 2016 have TPM 2.0
-        if ($manufacturer -match "(Dell|HP|Lenovo|ASUS|Acer|Microsoft)" -and 
-            $computerSystem.Model -match "20(1[6-9]|2[0-3])") {
-            $tpmCompatible = $true
-            $tpmEnabled = $false
-            $tpmVersion = "2.0"
-        }
+    # Check if TPM is enabled
+    $tpmEnabled = $false
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+        $tpmEnabled = $tpm.TpmPresent -and $tpm.TpmReady
+    } catch {
+        # Check WMI as fallback
+        $tpmWmi = Get-WmiDataSafely -Class Win32_Tpm -Namespace "root\CIMV2\Security\MicrosoftTpm"
+        $tpmEnabled = $null -ne $tpmWmi -and $tpmWmi.IsEnabled_InitialValue -eq $true
     }
 
-    # Add warning if TPM capable but disabled
-    if ($tpmCompatible -and -not $tpmEnabled) {
-        Write-Host "WARNING: TPM appears to be available but may not be enabled in BIOS" -ForegroundColor Yellow
-        Write-Host "        Check BIOS settings to enable TPM if needed" -ForegroundColor Yellow
+    # Enhanced warning messages for custom-built systems
+    if ($tpmCompatible) {
+        if (-not $tpmEnabled) {
+            Write-Host "WARNING: TPM 2.0 capability detected but not enabled" -ForegroundColor Yellow
+            Write-Host "        For Intel CPU: Look for 'Intel Platform Trust Technology (PTT)'" -ForegroundColor Yellow
+            Write-Host "        For AMD CPU: Look for 'AMD fTPM' or 'AMD Platform Security Processor'" -ForegroundColor Yellow
+            Write-Host "        Check BIOS/UEFI under: Security, Advanced, Trusted Computing, or TPM Configuration" -ForegroundColor Yellow
+            
+            # Add specific guidance based on motherboard manufacturer
+            switch -Regex ($mbManufacturer) {
+                'ASUS' { Write-Host "        ASUS: Advanced > Trusted Computing > TPM Device Selection > Firmware TPM" -ForegroundColor Yellow }
+                'MSI' { Write-Host "        MSI: Settings > Security > Trusted Computing > Security Device Support > Enable" -ForegroundColor Yellow }
+                'Gigabyte' { Write-Host "        Gigabyte: Settings > Miscellaneous > Trusted Computing > Security Device Support > Enable" -ForegroundColor Yellow }
+                'ASRock' { Write-Host "        ASRock: Security > Intel Platform Trust Technology or AMD fTPM > Enabled" -ForegroundColor Yellow }
+            }
+        }
     }
 
 } catch {

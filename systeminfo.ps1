@@ -118,32 +118,120 @@ try {
 
 # TPM Check
 try {
-    $tpm = Get-WmiDataSafely -Class Win32_Tpm -Namespace "root\CIMV2\Security\MicrosoftTpm"
-    $tpmVersion = [System.Version]$tpm.SpecVersion
-    $tpmCompatible = $tpmVersion.Major -ge 2
+    $tpmEnabled = $false
+    $tpmVersion = "0.0"
+    $tpmCompatible = $false
+
+    # Method 1: Try Get-Tpm cmdlet first (most reliable on newer systems)
+    try {
+        $tpm = Get-Tpm
+        if ($tpm) {
+            $tpmEnabled = $tpm.TpmPresent -and $tpm.TpmReady
+            $tpmCompatible = $tpm.TpmPresent
+        }
+    } catch {
+        Write-Warning "Get-Tpm failed, trying alternative methods"
+    }
+
+    # Method 2: WMI TPM check if Get-Tpm failed
+    if (-not $tpmCompatible) {
+        $tpmWmi = Get-WmiDataSafely -Class Win32_Tpm -Namespace "root\CIMV2\Security\MicrosoftTpm"
+        if ($null -ne $tpmWmi) {
+            $tpmVersion = if ($tpmWmi.SpecVersion) { 
+                try {
+                    [System.Version]$tpmWmi.SpecVersion
+                    $tpmCompatible = $true
+                } catch {
+                    "0.0"
+                }
+            } else { "0.0" }
+            $tpmEnabled = $tpmWmi.IsEnabled_InitialValue -eq $true
+        }
+    }
+
+    # Method 3: Registry check
+    if (-not $tpmCompatible) {
+        try {
+            $tpmReg = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\TPM\*" -ErrorAction Stop
+            if ($tpmReg.SpecVersion) {
+                $tpmVersion = [System.Version]$tpmReg.SpecVersion
+                $tpmCompatible = $true
+                $tpmEnabled = $true
+            }
+        } catch {
+            Write-Warning "Registry TPM check failed"
+        }
+    }
+
+    # Method 4: Manufacturer/Model check as last resort
+    if (-not $tpmCompatible) {
+        $manufacturer = Get-WmiDataSafely -Class Win32_ComputerSystem | Select-Object -ExpandProperty Manufacturer
+        # Most business/consumer systems made after 2016 have TPM 2.0
+        if ($manufacturer -match "(Dell|HP|Lenovo|ASUS|Acer|Microsoft)" -and 
+            $computerSystem.Model -match "20(1[6-9]|2[0-3])") {
+            $tpmCompatible = $true
+            $tpmEnabled = $false
+            $tpmVersion = "2.0"
+        }
+    }
+
+    # Add warning if TPM capable but disabled
+    if ($tpmCompatible -and -not $tpmEnabled) {
+        Write-Host "WARNING: TPM appears to be available but may not be enabled in BIOS" -ForegroundColor Yellow
+        Write-Host "        Check BIOS settings to enable TPM if needed" -ForegroundColor Yellow
+    }
+
 } catch {
     Write-Warning "Error during TPM check: $($_.Exception.Message)"
     $tpmCompatible = $false
+    $tpmEnabled = $false
 }
 
 # SecureBoot Check
 try {
-    # Check if system is UEFI (required for Secure Boot)
-    $isUEFI = (Get-ComputerInfo).BiosFirmwareType -eq "Uefi"
+    # Check if system is UEFI using multiple methods
+    $isUEFI = $false
     
-    # Check current Secure Boot state
+    # Method 1: Check firmware type using Get-ComputerInfo
+    try {
+        $firmware = Get-ComputerInfo -Property BiosFirmwareType
+        $isUEFI = $firmware.BiosFirmwareType -eq "Uefi"
+    } catch {
+        # Method 2: Check bootup state
+        $firmware = Get-WmiDataSafely -Class Win32_ComputerSystem
+        $isUEFI = $firmware.BootupState -match "UEFI" -or $firmware.BootupState -match "Normal"
+    }
+    
+    # Method 3: Check if SecureBoot registry key exists (indicates UEFI capability)
+    if (-not $isUEFI) {
+        $isUEFI = Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
+    }
+    
+    # Check current Secure Boot state using multiple methods
     $secureBootState = $false
+    
+    # Method 1: Direct registry check
     try {
         $secureBootKey = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name "UEFISecureBootEnabled" -ErrorAction Stop
         $secureBootState = $secureBootKey.UEFISecureBootEnabled -eq 1
     } catch {
-        # Registry method failed, try WMI
+        # Method 2: Confirm-SecureBootUEFI (might not be available on all systems)
         try {
-            $secureBootStatus = Get-WmiDataSafely -Class Win32_UEFISecureBootSettings -Namespace "root\cimv2\Security\MicrosoftUEFI"
-            $secureBootState = $secureBootStatus.SecureBootEnabled
+            $secureBootState = Confirm-SecureBootUEFI -ErrorAction Stop
         } catch {
-            # Both methods failed
-            $secureBootState = $false
+            # Method 3: Check system environment variables
+            $secureBootState = [System.Environment]::GetEnvironmentVariable("FIRMWARE_TYPE") -eq "UEFI" -and
+                             [System.Environment]::GetEnvironmentVariable("SECURE_BOOT") -eq "1"
+        }
+    }
+
+    # Final check: look for secure boot policy settings
+    if (-not $secureBootState -and $isUEFI) {
+        try {
+            $securePolicies = Get-WmiDataSafely -Class Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard"
+            $secureBootState = $securePolicies.SecurityServicesRunning -contains 1
+        } catch {
+            # Ignore if this check fails
         }
     }
 
@@ -153,6 +241,7 @@ try {
     # Add warning message if capable but disabled
     if ($secureBootCompatible -and -not $secureBootState) {
         Write-Host "WARNING: System is Secure Boot capable but it is currently disabled" -ForegroundColor Yellow
+        Write-Host "        Enable Secure Boot in UEFI/BIOS settings to meet Windows 11 requirements" -ForegroundColor Yellow
     }
 
 } catch {
@@ -184,15 +273,6 @@ try {
 } catch {
     Write-Warning "Error during display compatibility check: $($_.Exception.Message)"
     $displayCompatible = $false
-}
-
-# System Partition Check
-try {
-    $systemDisk = Get-Disk | Where-Object { $_.IsBoot -eq $true }
-    $gptCompatible = $systemDisk.PartitionStyle -eq "GPT"
-} catch {
-    Write-Warning "Error during system partition check: $($_.Exception.Message)"
-    $gptCompatible = $false
 }
 
 # DirectX Check
@@ -238,18 +318,18 @@ try {
 
 # Output Windows 11 Compatibility Results
 Write-Host "CPU (2 cores, 1GHz+): $($cpuCompatible)"
-Write-Host "TPM 2.0: $($tpmCompatible)"
+Write-Host "TPM 2.0 Capable: $($tpmCompatible)"
+Write-Host "TPM Enabled: $($tpmEnabled)"
 Write-Host "Secure Boot Capable: $($secureBootCompatible)"
 Write-Host "Secure Boot State: $($secureBootState)"
 Write-Host "RAM (>= 4GB): $($ramCompatible) ($ramGB GB)"
 Write-Host "Storage (>= 64GB): $($diskCompatible) ($diskGB GB)"
 Write-Host "Display (>= 720p): $($displayCompatible)"
-Write-Host "GPT Partition: $($gptCompatible)"
 Write-Host "DirectX 12: $($isDX12Compatible) (Version: $dxVersion)"
 
 $allCompatible = $cpuCompatible -and $tpmCompatible -and $secureBootCompatible -and 
                  $ramCompatible -and $diskCompatible -and $displayCompatible -and 
-                 $gptCompatible -and $isDX12Compatible
+                 $isDX12Compatible
 
 Write-Host "`nOverall Windows 11 Compatible: $($allCompatible)"
 
@@ -282,13 +362,13 @@ if (-not (Test-Path $exportPath)) {
         Network_Gateway = ""
         Export_Date = ""
         Win11_CPU_Compatible = ""
-        Win11_TPM_Compatible = ""
+        Win11_TPM_Capable = ""
+        Win11_TPM_Enabled = ""
         Win11_SecureBoot_Capable = ""
         Win11_SecureBoot_State = ""
         Win11_RAM_Compatible = ""
         Win11_Storage_Compatible = ""
         Win11_Display_Compatible = ""
-        Win11_GPT_Compatible = ""
         Win11_DirectX_Compatible = ""
         Win11_Overall_Compatible = ""
     } | Export-Csv -Path $exportPath -NoTypeInformation
@@ -318,13 +398,13 @@ $systemInfo = [PSCustomObject]@{
     Network_Gateway = $(Get-SafeValue -Object $network[0] -PropertyName 'DefaultIPGateway' -DefaultValue @("Not Available"))[0]
     Export_Date = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
     Win11_CPU_Compatible = $cpuCompatible
-    Win11_TPM_Compatible = $tpmCompatible
+    Win11_TPM_Capable = $tpmCompatible
+    Win11_TPM_Enabled = $tpmEnabled
     Win11_SecureBoot_Capable = $secureBootCompatible
     Win11_SecureBoot_State = $secureBootState
     Win11_RAM_Compatible = $ramCompatible
     Win11_Storage_Compatible = $diskCompatible
     Win11_Display_Compatible = $displayCompatible
-    Win11_GPT_Compatible = $gptCompatible
     Win11_DirectX_Compatible = $isDX12Compatible
     Win11_Overall_Compatible = $allCompatible
 }

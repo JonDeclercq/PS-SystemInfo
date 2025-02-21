@@ -14,3 +14,4 @@ Simply download the script and run it as Administrator with PowerShell (either o
   .\systeminfo.ps1
 ```
     
+*Most of the code was written by Claude Sonnet via Copilot*

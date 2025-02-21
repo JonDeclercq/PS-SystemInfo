@@ -1,4 +1,4 @@
-# Function to safely get WMI data
+# Function to safely get WMI/CIM data
 function Get-WmiDataSafely {
     param (
         [string]$Class,
@@ -6,10 +6,38 @@ function Get-WmiDataSafely {
         [scriptblock]$Filter = {$true}
     )
     try {
-        Get-WmiObject -Class $Class -Namespace $Namespace | Where-Object $Filter
+        # Try Get-CimInstance first (more reliable with permissions)
+        try {
+            $result = Get-CimInstance -ClassName $Class -Namespace $Namespace -ErrorAction Stop | 
+                Where-Object $Filter
+            if ($result) { return $result }
+        } catch {
+            Write-Verbose "CIM access failed, falling back to WMI: $($_.Exception.Message)"
+        }
+
+        # Fallback to Get-WmiObject
+        try {
+            $result = Get-WmiObject -Class $Class -Namespace $Namespace -ErrorAction Stop | 
+                Where-Object $Filter
+            if ($result) { return $result }
+        } catch {
+            Write-Verbose "WMI access failed: $($_.Exception.Message)"
+        }
+
+        # Last resort: try with alternative credentials if available
+        try {
+            $result = Get-CimInstance -ClassName $Class -Namespace $Namespace `
+                -ComputerName "localhost" -ErrorAction Stop | 
+                Where-Object $Filter
+            if ($result) { return $result }
+        } catch {
+            Write-Warning "Failed to get $Class data after all attempts"
+        }
+
+        return $null
     } catch {
         Write-Warning "Failed to get $Class data: $($_.Exception.Message)"
-        $null
+        return $null
     }
 }
 

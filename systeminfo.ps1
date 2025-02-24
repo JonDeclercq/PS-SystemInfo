@@ -65,13 +65,34 @@ $ram = Get-SafeValue -Object $computerSystem -PropertyName "TotalPhysicalMemory"
 $ramGB = [math]::Round($ram/1GB, 2)
 
 # Get GPU with fallback options
-$gpu = Get-WmiDataSafely -Class Win32_VideoController
-if (-not $gpu) {
-    $gpu = @{
+$gpu = @(Get-WmiDataSafely -Class Win32_VideoController)
+if (-not $gpu -or $gpu.Count -eq 0) {
+    $gpu = @(@{
         Name = "Unknown Graphics Device"
         VideoMemoryType = "Unknown"
         AdapterRAM = 0
+    })
+}
+
+# Function to get primary GPU name
+function Get-PrimaryGPUName {
+    param (
+        [Parameter(Mandatory=$true)]
+        [array]$gpuList
+    )
+    
+    # Try to find dedicated GPU first
+    $dedicatedGPU = $gpuList | Where-Object { 
+        $_.Name -match '(NVIDIA|AMD|ATI|Radeon|GeForce|RTX|GTX)' -and 
+        $_.Name -notmatch '(Microsoft|Basic|Generic)'
+    } | Select-Object -First 1
+    
+    if ($dedicatedGPU) {
+        return Get-SafeValue -Object $dedicatedGPU -PropertyName 'Name'
     }
+    
+    # Otherwise return the first GPU name
+    return Get-SafeValue -Object ($gpuList | Select-Object -First 1) -PropertyName 'Name'
 }
 
 # Get Disk info with validation
@@ -134,7 +155,7 @@ Write-Host "CPU: $(Get-SafeValue -Object $cpu -PropertyName 'Name')"
 Write-Host "CPU Cores: $(Get-SafeValue -Object $cpu -PropertyName 'NumberOfCores' -DefaultValue 0)"
 Write-Host "CPU Logical Processors: $(Get-SafeValue -Object $cpu -PropertyName 'NumberOfLogicalProcessors' -DefaultValue 0)"
 Write-Host "RAM: $ramGB GB"
-Write-Host "GPU: $($gpu.Name)"
+Write-Host "GPU: $(Get-PrimaryGPUName -gpuList $gpu)"
 Write-Host "OS: $($os.Caption)"
 Write-Host "OS Version: $($os.Version)"
 Write-Host "OS Architecture: $($os.OSArchitecture)"
@@ -588,7 +609,7 @@ $systemInfo = [PSCustomObject]@{
     CPU_Cores = $(Get-SafeValue -Object $cpu -PropertyName 'NumberOfCores' -DefaultValue 0)
     CPU_LogicalProcessors = $(Get-SafeValue -Object $cpu -PropertyName 'NumberOfLogicalProcessors' -DefaultValue 0)
     RAM_GB = $ramGB
-    GPU_Name = $gpuName
+    GPU_Name = Get-PrimaryGPUName -gpuList $gpu
     OS_Name = $os.Caption
     OS_Version = $os.Version
     OS_Architecture = $os.OSArchitecture
